@@ -3,7 +3,7 @@
 #
 # Container for running the Brandy indexer in production.
 
-FROM rust:1.64-alpine3.16 AS builder
+FROM rust:1.65.0-alpine3.16 AS builder
 RUN apk add --no-cache musl-dev
 COPY . /build
 WORKDIR /build
