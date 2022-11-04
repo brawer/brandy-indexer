@@ -9,10 +9,8 @@
 name: Package
 on:
   push:
-    branches:
-    - 'main'
     tags:
-    - v**
+    - '*'
 
 jobs:
   package:
