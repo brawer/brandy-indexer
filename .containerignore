@@ -1,0 +1,8 @@
+# File paths to ignore when building a container for production.
+#
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2022 Sascha Brawer <sascha@brawer.ch>
+
+workdir
+target
+
