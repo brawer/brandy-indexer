@@ -2,20 +2,21 @@
 // SPDX-FileCopyrightText: 2022 Sascha Brawer <sascha@brawer.ch>
 
 use bitvec::prelude::{BitVec, Lsb0};
-use byteorder::{ReadBytesExt, WriteBytesExt};
+//use byteorder::{ReadBytesExt, WriteBytesExt};
 use clap::Parser;
 use extsort::{ExternalSorter, Sortable};
-use memmap::{Mmap, MmapOptions};
 use osmpbf::{BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs;
-use std::io::{BufWriter, Read, Write};
-use std::mem;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 use std::thread;
+
+mod idmap;
+use crate::idmap::{IdMap, IdPair};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -36,29 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct IdPair(u64, u64);
-
-impl Sortable for IdPair {
-    fn encode<W: Write>(&self, write: &mut W) {
-        write.write_u64::<byteorder::LittleEndian>(self.0).unwrap();
-        write.write_u64::<byteorder::LittleEndian>(self.1).unwrap();
-    }
-
-    fn decode<R: Read>(read: &mut R) -> Option<IdPair> {
-        let a = read.read_u64::<byteorder::LittleEndian>().ok()?;
-        let b = read.read_u64::<byteorder::LittleEndian>().ok()?;
-        Some(IdPair(a, b))
-    }
-}
-
-struct RelPhase {
-    reltree: SyncSender<IdPair>,       // child rel → parent rel
-    nodes_in_rels: SyncSender<IdPair>, // child node → parent rel
-    ways_in_rels: SyncSender<IdPair>,  // child way → parent rel
-}
-
-fn build_pairs(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread::JoinHandle<()>) {
+fn build_id_pairs(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread::JoinHandle<()>) {
     let (tx, rx) = sync_channel::<IdPair>(64 * 1024);
     let mut sort_dir = PathBuf::from(workdir);
     sort_dir.push(format!("sort-{filename}"));
@@ -86,11 +65,17 @@ fn build_pairs(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread::J
     (tx, join_handle)
 }
 
+struct RelPhase {
+    reltree: SyncSender<IdPair>,       // child rel → parent rel
+    nodes_in_rels: SyncSender<IdPair>, // child node → parent rel
+    ways_in_rels: SyncSender<IdPair>,  // child way → parent rel
+}
+
 impl RelPhase {
     fn run(path: &Path, workdir: &Path) -> Result<(), Box<dyn Error>> {
-        let (reltree, reltree_worker) = build_pairs(workdir, "reltree_all");
-        let (nodes_in_rels, nodes_in_rels_worker) = build_pairs(workdir, "nodes_in_rels_all");
-        let (ways_in_rels, ways_in_rels_worker) = build_pairs(workdir, "ways_in_rels_all");
+        let (reltree, reltree_worker) = build_id_pairs(workdir, "reltree_all");
+        let (nodes_in_rels, nodes_in_rels_worker) = build_id_pairs(workdir, "nodes_in_rels_all");
+        let (ways_in_rels, ways_in_rels_worker) = build_id_pairs(workdir, "ways_in_rels_all");
         let mut phase = RelPhase {
             reltree,
             nodes_in_rels,
@@ -232,110 +217,6 @@ impl RelPhase {
     }
 }
 
-struct IdMap<'a> {
-    mmap: Mmap,
-    data: &'a [IdPair],
-}
-
-impl<'a> IdMap<'a> {
-    fn open(path: &Path) -> std::io::Result<IdMap> {
-        let file = fs::File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let data_ptr = mmap.as_ptr() as *const IdPair;
-        let data_len = mmap.len() / mem::size_of::<IdPair>();
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
-        Ok(IdMap { mmap, data })
-    }
-
-    fn contains_key(&self, key: &u64) -> bool {
-        return self.data.binary_search_by_key(key, |x| x.0).is_ok();
-    }
-
-    fn get(&self, key: u64) -> IdMapIter {
-        let pos = self.data.partition_point(|x| x.0 < key);
-        IdMapIter {
-            map: self.data,
-            key,
-            pos,
-        }
-    }
-
-    fn keys(&self) -> IdMapKeyIter {
-        IdMapKeyIter {
-            data: self.data,
-            pos: 0,
-        }
-    }
-
-    fn iter(&self) -> IdMapEntriesIter {
-        IdMapEntriesIter {
-            data: self.data,
-            pos: 0,
-        }
-    }
-}
-
-struct IdMapKeyIter<'a> {
-    data: &'a [IdPair],
-    pos: usize,
-}
-
-impl<'a> Iterator for IdMapKeyIter<'a> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let limit = self.data.len();
-        if self.pos >= limit {
-            return None;
-        }
-        let key = self.data[self.pos].0;
-        while self.pos < limit && self.data[self.pos].0 == key {
-            self.pos += 1
-        }
-        return Some(key);
-    }
-}
-
-struct IdMapIter<'a> {
-    map: &'a [IdPair],
-    key: u64,
-    pos: usize,
-}
-
-impl<'a> Iterator for IdMapIter<'a> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.map.len() {
-            return None;
-        }
-        let entry = &self.map[self.pos];
-        if entry.0 != self.key {
-            return None;
-        }
-        self.pos += 1;
-        return Some(entry.1);
-    }
-}
-
-struct IdMapEntriesIter<'a> {
-    data: &'a [IdPair],
-    pos: usize,
-}
-
-impl<'a> Iterator for IdMapEntriesIter<'a> {
-    type Item = &'a IdPair;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
-        let entry = &self.data[self.pos];
-        self.pos += 1;
-        Some(entry)
-    }
-}
-
 fn keep_rel(reltree: &IdMap, rel: u64) -> bool {
     let mut chain = Vec::<u64>::with_capacity(8);
     return _keep_rel(reltree, rel, &mut chain);
@@ -449,25 +330,7 @@ fn join_path(path: &Path, filename: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_idmap(data: &[IdPair]) -> IdMap {
-        let mmap_mut = MmapOptions::new().len(4096).map_anon().unwrap();
-        let mmap = mmap_mut.make_read_only().unwrap();
-        IdMap { mmap, data }
-    }
-
-    #[test]
-    fn idmap_keys() {
-        let idmap = make_idmap(&[
-            IdPair(4, 444),
-            IdPair(7, 0),
-            IdPair(7, 1),
-            IdPair(7, 2),
-            IdPair(7, 3),
-            IdPair(9, 99),
-        ]);
-        assert!(idmap.keys().collect::<Vec<u64>>() == &[4, 7, 9]);
-    }
+    use crate::idmap::tests::make_idmap;
 
     #[test]
     fn keep_rel_works() {
