@@ -5,7 +5,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 //use byteorder::{ReadBytesExt, WriteBytesExt};
 use clap::Parser;
 use extsort::{ExternalSorter, Sortable};
-use osmpbf::{BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
+use osmpbf::{Blob, BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs;
@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 use std::thread;
+use std::time::SystemTime;
 
 mod idmap;
 use crate::idmap::{IdMap, IdPair};
@@ -32,8 +33,9 @@ struct Cli {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let dump = PlanetDump::open(cli.planet.as_path())?;
     let workdir = cli.workdir.as_path();
-    RelPhase::run(cli.planet.as_path(), workdir)?;
+    RelPhase::run(&dump, workdir)?;
     Ok(())
 }
 
@@ -65,6 +67,49 @@ fn build_id_pairs(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread
     (tx, join_handle)
 }
 
+struct PlanetDump {
+    node_blobs: Vec<Blob>,
+    way_blobs: Vec<Blob>,
+    rel_blobs: Vec<Blob>,
+}
+
+impl PlanetDump {
+    fn open(path: &Path) -> osmpbf::Result<PlanetDump> {
+        let start = SystemTime::now();
+        let mut blobs: Vec<Blob> = Vec::new();
+        for b in BlobReader::from_path(path)? {
+            blobs.push(b?);
+        }
+
+        // Partition planet dump into (node_blobs, way_blobs, rel_blobs).
+        let (left, rel_blobs): (Vec<Blob>, Vec<Blob>) = blobs.into_par_iter().partition(|b| {
+            if let Ok(BlobDecode::OsmData(block)) = b.decode() {
+                !block.groups().any(|g| g.relations().next().is_some())
+            } else {
+                true
+            }
+        });
+        let (node_blobs, way_blobs): (Vec<Blob>, Vec<Blob>) = left.into_par_iter().partition(|b| {
+            if let Ok(BlobDecode::OsmData(block)) = b.decode() {
+                !block.groups().any(|g| g.ways().next().is_some())
+            } else {
+                true
+            }
+        });
+
+        println!(
+            "PlanetDump opened in {:.1} secs",
+            start.elapsed().unwrap().as_secs_f32()
+        );
+
+        Ok(PlanetDump {
+            node_blobs,
+            way_blobs,
+            rel_blobs,
+        })
+    }
+}
+
 struct RelPhase {
     reltree: SyncSender<IdPair>,       // child rel → parent rel
     nodes_in_rels: SyncSender<IdPair>, // child node → parent rel
@@ -72,7 +117,8 @@ struct RelPhase {
 }
 
 impl RelPhase {
-    fn run(path: &Path, workdir: &Path) -> Result<(), Box<dyn Error>> {
+    fn run(dump: &PlanetDump, workdir: &Path) -> Result<(), Box<dyn Error>> {
+        let phase_start = SystemTime::now();
         let (reltree, reltree_worker) = build_id_pairs(workdir, "reltree_all");
         let (nodes_in_rels, nodes_in_rels_worker) = build_id_pairs(workdir, "nodes_in_rels_all");
         let (ways_in_rels, ways_in_rels_worker) = build_id_pairs(workdir, "ways_in_rels_all");
@@ -82,11 +128,11 @@ impl RelPhase {
             ways_in_rels,
         };
         let m = Mutex::new(&mut phase);
-        let blobs = BlobReader::from_path(path)?;
-        blobs
-            .into_iter()
+
+        dump.rel_blobs
+            .iter()
             .par_bridge()
-            .try_for_each(|b| match b?.decode() {
+            .try_for_each(|b| match b.decode() {
                 Ok(BlobDecode::OsmData(block)) => RelPhase::process(&m, block),
                 Ok(BlobDecode::OsmHeader(_)) => Ok(()),
                 Ok(BlobDecode::Unknown(_)) => Ok(()),
@@ -110,6 +156,10 @@ impl RelPhase {
         Self::prune_reltree(workdir)?;
         Self::prune_ways_in_rels(workdir)?;
         Self::prune_nodes_in_rels(workdir)?;
+        println!(
+            "RelPhase finished in {:.1} secs",
+            phase_start.elapsed().unwrap().as_secs_f32()
+        );
 
         Ok(())
     }
