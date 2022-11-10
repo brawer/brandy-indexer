@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dump = PlanetDump::open(cli.planet.as_path())?;
     let config = TagMatcherConfig::new();
     let workdir = cli.workdir.as_path();
-    RelPhase::run(&dump, &config, workdir)?;
+    RelPhase::run(&dump.rel_blobs, &config, workdir)?;
     Ok(())
 }
 
@@ -90,7 +90,7 @@ struct RelPhase<'a> {
 
 impl<'a> RelPhase<'a> {
     fn run(
-        dump: &PlanetDump,
+        rel_blobs: &Vec<Blob>,
         tag_matcher_config: &TagMatcherConfig,
         workdir: &Path,
     ) -> Result<(), Box<dyn Error>> {
@@ -106,15 +106,12 @@ impl<'a> RelPhase<'a> {
         };
         let m = Mutex::new(&mut phase);
 
-        dump.rel_blobs
-            .iter()
-            .par_bridge()
-            .try_for_each(|b| match b.decode() {
-                Ok(BlobDecode::OsmData(block)) => RelPhase::process(&m, block),
-                Ok(BlobDecode::OsmHeader(_)) => Ok(()),
-                Ok(BlobDecode::Unknown(_)) => Ok(()),
-                Err(e) => Err(e),
-            })?;
+        rel_blobs.par_iter().try_for_each(|b| match b.decode() {
+            Ok(BlobDecode::OsmData(block)) => RelPhase::process(&m, block),
+            Ok(BlobDecode::OsmHeader(_)) => Ok(()),
+            Ok(BlobDecode::Unknown(_)) => Ok(()),
+            Err(e) => Err(e),
+        })?;
 
         // Close channels. This tells workers there’s no more data coming.
         drop(phase.reltree);
