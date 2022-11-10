@@ -2,18 +2,16 @@
 // SPDX-FileCopyrightText: 2022 Sascha Brawer <sascha@brawer.ch>
 
 use bitvec::prelude::{BitVec, Lsb0};
-//use byteorder::{ReadBytesExt, WriteBytesExt};
 use clap::Parser;
-use extsort::{ExternalSorter, Sortable};
+use extsort::Sortable;
 use osmpbf::{Blob, BlobDecode, BlobReader, PrimitiveBlock, RelMemberType};
 use rayon::prelude::*;
 use std::error::Error;
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::sync::Mutex;
-use std::thread;
 use std::time::SystemTime;
 
 mod idmap;
@@ -37,34 +35,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let workdir = cli.workdir.as_path();
     RelPhase::run(&dump, workdir)?;
     Ok(())
-}
-
-fn build_id_pairs(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread::JoinHandle<()>) {
-    let (tx, rx) = sync_channel::<IdPair>(64 * 1024);
-    let mut sort_dir = PathBuf::from(workdir);
-    sort_dir.push(format!("sort-{filename}"));
-    if sort_dir.try_exists().ok() == Some(true) {
-        fs::remove_dir_all(sort_dir.as_path()).expect("cannot delete pre-existing sort_dir");
-    }
-    fs::create_dir_all(sort_dir.as_path()).expect("cannot create sort_dir");
-
-    let filename = filename.to_string();
-    let sort_dir = sort_dir.clone();
-    let mut output_path = PathBuf::from(workdir);
-    output_path.push(filename);
-    let join_handle = thread::spawn(move || {
-        let file = fs::File::create(output_path).unwrap();
-        let mut writer = BufWriter::with_capacity(64 * 1024, file);
-        let sorter = ExternalSorter::new()
-            .with_sort_dir(sort_dir.clone())
-            .with_segment_size(1024 * 1024);
-        for pair in sorter.sort(rx.iter()).unwrap() {
-            pair.encode(&mut writer);
-        }
-        fs::remove_dir_all(sort_dir.as_path()).expect("cannot delete sort_dir");
-    });
-
-    (tx, join_handle)
 }
 
 struct PlanetDump {
@@ -119,9 +89,9 @@ struct RelPhase {
 impl RelPhase {
     fn run(dump: &PlanetDump, workdir: &Path) -> Result<(), Box<dyn Error>> {
         let phase_start = SystemTime::now();
-        let (reltree, reltree_worker) = build_id_pairs(workdir, "reltree_all");
-        let (nodes_in_rels, nodes_in_rels_worker) = build_id_pairs(workdir, "nodes_in_rels_all");
-        let (ways_in_rels, ways_in_rels_worker) = build_id_pairs(workdir, "ways_in_rels_all");
+        let (reltree, reltree_worker) = IdMap::build(workdir, "reltree_all");
+        let (nodes_in_rels, nodes_in_rels_worker) = IdMap::build(workdir, "nodes_in_rels_all");
+        let (ways_in_rels, ways_in_rels_worker) = IdMap::build(workdir, "ways_in_rels_all");
         let mut phase = RelPhase {
             reltree,
             nodes_in_rels,

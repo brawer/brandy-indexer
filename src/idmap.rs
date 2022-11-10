@@ -2,12 +2,14 @@
 // SPDX-FileCopyrightText: 2022 Sascha Brawer <sascha@brawer.ch>
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use extsort::Sortable;
+use extsort::{ExternalSorter, Sortable};
 use memmap::{Mmap, MmapOptions};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::thread;
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct IdPair(pub u64, pub u64);
@@ -41,6 +43,34 @@ impl<'a> IdMap<'a> {
             _mmap: mmap,
             data: data,
         })
+    }
+
+    pub fn build(workdir: &Path, filename: &str) -> (SyncSender<IdPair>, thread::JoinHandle<()>) {
+        let (tx, rx) = sync_channel::<IdPair>(64 * 1024);
+        let mut sort_dir = PathBuf::from(workdir);
+        sort_dir.push(format!("sort-{filename}"));
+        if sort_dir.try_exists().ok() == Some(true) {
+            fs::remove_dir_all(sort_dir.as_path()).expect("cannot delete pre-existing sort_dir");
+        }
+        fs::create_dir_all(sort_dir.as_path()).expect("cannot create sort_dir");
+
+        let filename = filename.to_string();
+        let sort_dir = sort_dir.clone();
+        let mut output_path = PathBuf::from(workdir);
+        output_path.push(filename);
+        let join_handle = thread::spawn(move || {
+            let file = fs::File::create(output_path).unwrap();
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            let sorter = ExternalSorter::new()
+                .with_sort_dir(sort_dir.clone())
+                .with_segment_size(1024 * 1024);
+            for pair in sorter.sort(rx.iter()).unwrap() {
+                pair.encode(&mut writer);
+            }
+            fs::remove_dir_all(sort_dir.as_path()).expect("cannot delete sort_dir");
+        });
+
+        (tx, join_handle)
     }
 
     pub fn get(&self, key: u64) -> IdMapIter {
