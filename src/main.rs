@@ -32,8 +32,9 @@ struct Cli {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let dump = PlanetDump::open(cli.planet.as_path())?;
+    let config = TagMatcherConfig::new();
     let workdir = cli.workdir.as_path();
-    RelPhase::run(&dump, workdir)?;
+    RelPhase::run(&dump, &config, workdir)?;
     Ok(())
 }
 
@@ -80,19 +81,25 @@ impl PlanetDump {
     }
 }
 
-struct RelPhase {
+struct RelPhase<'a> {
+    tag_matcher_config: &'a TagMatcherConfig<'a>,
     reltree: SyncSender<IdPair>,       // child rel → parent rel
     nodes_in_rels: SyncSender<IdPair>, // child node → parent rel
     ways_in_rels: SyncSender<IdPair>,  // child way → parent rel
 }
 
-impl RelPhase {
-    fn run(dump: &PlanetDump, workdir: &Path) -> Result<(), Box<dyn Error>> {
+impl<'a> RelPhase<'a> {
+    fn run(
+        dump: &PlanetDump,
+        tag_matcher_config: &TagMatcherConfig,
+        workdir: &Path,
+    ) -> Result<(), Box<dyn Error>> {
         let phase_start = SystemTime::now();
         let (reltree, reltree_worker) = IdMap::build(workdir, "reltree_all");
         let (nodes_in_rels, nodes_in_rels_worker) = IdMap::build(workdir, "nodes_in_rels_all");
         let (ways_in_rels, ways_in_rels_worker) = IdMap::build(workdir, "ways_in_rels_all");
         let mut phase = RelPhase {
+            tag_matcher_config,
             reltree,
             nodes_in_rels,
             ways_in_rels,
@@ -135,17 +142,19 @@ impl RelPhase {
     }
 
     fn process(phase: &Mutex<&mut Self>, block: PrimitiveBlock) -> Result<(), osmpbf::Error> {
+        let tag_matcher_config;
         let reltree;
         let nodes_in_rels;
         let ways_in_rels;
         {
             let phase = phase.lock().unwrap();
+            tag_matcher_config = phase.tag_matcher_config;
             reltree = phase.reltree.clone();
             nodes_in_rels = phase.nodes_in_rels.clone();
             ways_in_rels = phase.ways_in_rels.clone();
         }
 
-        let matcher = TagMatcher::new(&block);
+        let matcher = TagMatcher::new(&block, tag_matcher_config);
         for group in block.groups() {
             for rel in group.relations() {
                 let rel_id = rel.id() as u64;
@@ -259,6 +268,38 @@ fn _keep_rel(reltree: &IdMap, rel: u64, chain: &mut Vec<u64>) -> bool {
     return false;
 }
 
+// Placeholder for NSI configuration, country boundaries, and other data
+// needed for deciding whether we're interested in a tagged OpenStreetMap
+// node/way/relation. For now, we just look for a few hardcoded names;
+// in the long term, this will probably evolve into a fast implementation
+// of NSI,the OpenStreetMap Name Suggestion Index. See also https://nsi.guide/.
+struct TagMatcherConfig<'a> {
+    nsi_names: Vec<&'a str>,
+}
+
+impl<'a> TagMatcherConfig<'a> {
+    fn new() -> TagMatcherConfig<'a> {
+        let nsi_names = vec!["Brezelkönig", "Starbucks", "Müller", "ZVV"];
+        TagMatcherConfig { nsi_names }
+    }
+
+    fn is_nsi_key(&self, key: &str) -> bool {
+        key == "brand"
+            || key.starts_with("brand:")
+            || key == "name"
+            || key.starts_with("name:")
+            || key == "network"
+            || key.starts_with("network:")
+            || key == "operator"
+            || key.starts_with("operator:")
+    }
+
+    fn is_nsi_value(&self, v: &str) -> bool {
+        self.nsi_names.contains(&v)
+        // v == "Starbucks" || v == "Brezelkönig" || v == "Müller" || v == "ZVV"
+    }
+}
+
 struct TagMatcher {
     wikidata_keys: BitVec,
     nsi_keys: BitVec,
@@ -266,7 +307,7 @@ struct TagMatcher {
 }
 
 impl TagMatcher {
-    fn new(block: &PrimitiveBlock) -> TagMatcher {
+    fn new(block: &PrimitiveBlock, config: &TagMatcherConfig) -> TagMatcher {
         let stringtable: Vec<&str> = block
             .raw_stringtable()
             .iter()
@@ -285,10 +326,10 @@ impl TagMatcher {
             if is_wikidata_key(s) {
                 wikidata_keys.set(i, true);
             }
-            if is_nsi_key(s) {
+            if config.is_nsi_key(s) {
                 nsi_keys.set(i, true);
             }
-            if is_nsi_value(s) {
+            if config.is_nsi_value(s) {
                 nsi_values.set(i, true);
             }
         }
@@ -324,21 +365,6 @@ fn is_wikidata_key(key: &str) -> bool {
     } else {
         key.ends_with(":wikidata")
     }
-}
-
-fn is_nsi_key(key: &str) -> bool {
-    key == "brand"
-        || key.starts_with("brand:")
-        || key == "name"
-        || key.starts_with("name:")
-        || key == "network"
-        || key.starts_with("network:")
-        || key == "operator"
-        || key.starts_with("operator:")
-}
-
-fn is_nsi_value(v: &str) -> bool {
-    v == "Starbucks" || v == "Brezelkönig" || v == "Müller" || v == "ZVV"
 }
 
 fn join_path(path: &Path, filename: &str) -> PathBuf {
